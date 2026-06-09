@@ -951,8 +951,6 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         let mut node_key = None;
         let mut write_chunk = false;
 
-        let root_bounds = self.root_node.bounds;
-
         // starting from the root walk thorugh the octree
         // and find the correct node to add the point to
         let mut nodes_to_check = vec![&mut self.root_node];
@@ -967,9 +965,15 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
                 if node.children.is_empty() {
                     // the node does not have any children
                     // so lets add children to the node
+                    // (split this node's bounds rather than re-deriving each
+                    // child cube from the root — see add_point_voxel)
+                    let center_x = (node.bounds.min.x + node.bounds.max.x) / 2.0;
+                    let center_y = (node.bounds.min.y + node.bounds.max.y) / 2.0;
+                    let center_z = (node.bounds.min.z + node.bounds.max.z) / 2.0;
                     let child_keys = node.entry.key.children();
-                    for key in child_keys {
-                        let child_bounds = key.bounds(&root_bounds);
+                    for (dir, key) in child_keys.into_iter().enumerate() {
+                        let child_bounds =
+                            split_bounds(&node.bounds, center_x, center_y, center_z, dir as i32);
                         node.children.push(OctreeNode {
                             entry: Entry {
                                 key,
@@ -1065,7 +1069,13 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
                 | (((point.y >= center_y) as i32) << 1)
                 | (((point.z >= center_z) as i32) << 2);
             key = key.child(dir);
-            node_bounds = key.bounds(&root_bounds);
+            // Split the parent bounds at the same centers used to pick `dir`
+            // instead of re-deriving the child cube from the root
+            // (`key.bounds` sizes every axis from the root's x edge, whose
+            // rounding can disagree with the per-axis bounds by an ULP —
+            // enough to put a point just outside the child it was assigned
+            // to). Subdividing locally keeps containment exact by construction.
+            node_bounds = split_bounds(&node_bounds, center_x, center_y, center_z, dir);
             debug_assert!(
                 bounds_contains_point(&node_bounds, &point),
                 "voxel descent must keep the point in the selected key bounds"
@@ -1096,6 +1106,29 @@ fn voxel_cell(bounds: &las::Bounds, point: &las::Point, grid: i64) -> u64 {
     let y = index(point.y, bounds.min.y);
     let z = index(point.z, bounds.min.z);
     (x + y * grid + z * grid * grid) as u64
+}
+
+/// The `dir`-indexed octant of `b` split at the given center (bit 0 = upper x,
+/// bit 1 = upper y, bit 2 = upper z) — mirrors `VoxelKey::child`. Unlike
+/// `VoxelKey::bounds`, which sizes every axis from the root cube's x edge,
+/// this subdivides the actual per-axis bounds, so a child face always equals
+/// the parent's center/face bit-for-bit and octants partition the parent with
+/// no ULP gaps.
+#[inline]
+fn split_bounds(b: &las::Bounds, cx: f64, cy: f64, cz: f64, dir: i32) -> las::Bounds {
+    let upper = |bit: i32| dir >> bit & 1 == 1;
+    las::Bounds {
+        min: las::Vector {
+            x: if upper(0) { cx } else { b.min.x },
+            y: if upper(1) { cy } else { b.min.y },
+            z: if upper(2) { cz } else { b.min.z },
+        },
+        max: las::Vector {
+            x: if upper(0) { b.max.x } else { cx },
+            y: if upper(1) { b.max.y } else { cy },
+            z: if upper(2) { b.max.z } else { cz },
+        },
+    }
 }
 
 #[inline]
