@@ -417,6 +417,49 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         result
     }
 
+    /// Like [`Self::write`] but polls `cancel` every 4096 points and aborts with
+    /// [`crate::Error::Cancelled`] if it returns true. Closes the writer on success.
+    pub fn write_cancellable<D, F>(&mut self, data: D, num_points: i32, mut cancel: F) -> crate::Result<()>
+    where
+        D: IntoIterator<Item = las::Point>,
+        F: FnMut() -> bool,
+    {
+        if self.is_closed {
+            return Err(crate::Error::ClosedWriter);
+        }
+        let greedy = num_points < self.max_node_size + self.min_node_size;
+        let levels = self.expected_levels(num_points.max(0) as usize);
+        let mut invalid = Ok(());
+        for (i, p) in data.into_iter().enumerate() {
+            if i % 4096 == 0 && cancel() {
+                // copc-rs's Drop calls close().expect(), which panics on an
+                // unfinished writer. Mark closed so the abort unwinds cleanly
+                // (the partial file is the caller's to delete).
+                self.is_closed = true;
+                return Err(crate::Error::Cancelled);
+            }
+            if !p.matches(self.header.point_format()) {
+                invalid = Err(crate::Error::InvalidPoint(
+                    crate::PointAddError::PointAttributesDoNotMatch(*self.header.point_format()),
+                ));
+                continue;
+            }
+            if !bounds_contains_point(&self.root_node.bounds, &p) {
+                if invalid.is_ok() {
+                    invalid = Err(crate::Error::InvalidPoint(crate::PointAddError::PointNotInBounds));
+                }
+                continue;
+            }
+            if greedy || (num_points as usize) <= i {
+                self.add_point_greedy(p)?;
+            } else {
+                self.add_point_stochastic(p, levels)?;
+            }
+        }
+        self.close()?;
+        invalid
+    }
+
     /// Whether this writer is closed or not
     pub fn is_closed(&self) -> bool {
         self.is_closed
@@ -450,6 +493,13 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
 
 /// private functions
 impl<W: Write + Seek> CopcWriter<'_, W> {
+    /// Expected octree depth for the stochastic fill (2D-surface assumption).
+    fn expected_levels(&self, num_points: usize) -> usize {
+        ((((3 * num_points) as f64 / self.max_node_size as f64 + 1.).log2() - 2.) / 2.)
+            .ceil()
+            .max(0.0) as usize
+    }
+
     /// Greedy strategy for writing points
     fn write_greedy<D: IntoIterator<Item = las::Point>>(&mut self, data: D) -> crate::Result<()> {
         let mut invalid_points = Ok(());
@@ -590,8 +640,12 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         })?;
 
         // update the copc info vlr and write it
-        self.copc_info.spacing =
-            2. * self.copc_info.halfsize / (self.root_node.entry.point_count as f64);
+        // Root-level point spacing. LiDAR points lie on ~2D surfaces, so
+        // points-per-edge ~= sqrt(root_node_points); spacing = cube edge / that.
+        // (Upstream used edge/point_count, ~sqrt(N)x too small, misinforming
+        // viewer LOD selection — measured 0.066 vs PDAL's 7.40 on a real cloud.)
+        let root_pts = self.root_node.entry.point_count.max(1) as f64;
+        self.copc_info.spacing = 2. * self.copc_info.halfsize / root_pts.sqrt();
         self.copc_info.root_hier_offset = start_of_first_evlr + 60; // the header is 60bytes
         self.copc_info.root_hier_size = self.hierarchy.byte_size();
 
@@ -615,10 +669,10 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
     fn add_point_greedy(&mut self, point: las::Point) -> crate::Result<()> {
         self.header.add_point(&point);
 
-        if point.gps_time.unwrap() < self.copc_info.gpstime_minimum {
-            self.copc_info.gpstime_minimum = point.gps_time.unwrap();
-        } else if point.gps_time.unwrap() > self.copc_info.gpstime_maximum {
-            self.copc_info.gpstime_maximum = point.gps_time.unwrap();
+        if point.gps_time.unwrap_or(0.0) < self.copc_info.gpstime_minimum {
+            self.copc_info.gpstime_minimum = point.gps_time.unwrap_or(0.0);
+        } else if point.gps_time.unwrap_or(0.0) > self.copc_info.gpstime_maximum {
+            self.copc_info.gpstime_maximum = point.gps_time.unwrap_or(0.0);
         }
 
         let mut node_key = None;
@@ -764,10 +818,10 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
 
         self.header.add_point(&point);
 
-        if point.gps_time.unwrap() < self.copc_info.gpstime_minimum {
-            self.copc_info.gpstime_minimum = point.gps_time.unwrap();
-        } else if point.gps_time.unwrap() > self.copc_info.gpstime_maximum {
-            self.copc_info.gpstime_maximum = point.gps_time.unwrap();
+        if point.gps_time.unwrap_or(0.0) < self.copc_info.gpstime_minimum {
+            self.copc_info.gpstime_minimum = point.gps_time.unwrap_or(0.0);
+        } else if point.gps_time.unwrap_or(0.0) > self.copc_info.gpstime_maximum {
+            self.copc_info.gpstime_maximum = point.gps_time.unwrap_or(0.0);
         }
 
         let raw_point = point.into_raw(self.header.transforms())?;

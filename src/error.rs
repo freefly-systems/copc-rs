@@ -10,6 +10,9 @@ pub enum Error {
     #[error("This writer has already been closed")]
     ClosedWriter,
 
+    #[error("COPC write cancelled")]
+    Cancelled,
+
     /// When trying to close an empty copc file
     #[error("There are no points added to this file")]
     EmptyCopcFile,
