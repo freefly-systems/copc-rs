@@ -5,10 +5,11 @@ use crate::copc::{CopcInfo, Entry, HierarchyPage, OctreeNode, VoxelKey};
 
 use las::{Builder, Header};
 
-use std::collections::HashMap;
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // enum for point data record format upgrades
 enum UpgradePdrf {
@@ -41,8 +42,233 @@ pub struct CopcWriter<'a, W: 'a + Write + Seek> {
     copc_info: CopcInfo,
     // root node in octree, access point for the tree
     root_node: OctreeNode,
-    // a hashmap to store chunks that are not full yet
-    open_chunks: HashMap<VoxelKey, Cursor<Vec<u8>>>,
+    chunk_store: ChunkStore,
+    // Per-node voxel cells that already have a representative point.
+    voxel_occupancy: HashMap<VoxelKey, HashSet<u64>>,
+}
+
+const DEFAULT_MAX_VOXEL_LEVEL: i32 = 18;
+const MAX_VOXEL_LEVEL_CAP: i32 = 24;
+
+#[derive(Clone, Debug)]
+pub struct WriterOptions {
+    pub memory_budget_bytes: u64,
+    pub temp_dir: Option<PathBuf>,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        WriterOptions {
+            memory_budget_bytes: 4 * 1024 * 1024 * 1024,
+            temp_dir: None,
+        }
+    }
+}
+
+struct ChunkStore {
+    memory_budget_bytes: u64,
+    buffered_bytes: u64,
+    temp_dir: PathBuf,
+    chunks: HashMap<VoxelKey, ChunkBuffer>,
+}
+
+enum ChunkBuffer {
+    InMemory {
+        bytes: Vec<u8>,
+        point_count: u32,
+    },
+    Spilled {
+        path: PathBuf,
+        point_count: u32,
+        byte_count: u64,
+    },
+}
+
+impl ChunkStore {
+    fn new(options: &WriterOptions) -> crate::Result<Self> {
+        Ok(ChunkStore {
+            memory_budget_bytes: options.memory_budget_bytes,
+            buffered_bytes: 0,
+            temp_dir: options.temp_dir.clone().unwrap_or_else(default_spill_dir),
+            chunks: HashMap::default(),
+        })
+    }
+
+    fn append(&mut self, key: VoxelKey, bytes: Vec<u8>) -> crate::Result<()> {
+        let byte_count = bytes.len() as u64;
+        if matches!(self.chunks.get(&key), Some(ChunkBuffer::Spilled { .. })) {
+            return self.append_to_spilled(key, bytes);
+        }
+
+        self.ensure_budget_for(bytes.len())?;
+        if matches!(self.chunks.get(&key), Some(ChunkBuffer::Spilled { .. })) {
+            return self.append_to_spilled(key, bytes);
+        }
+
+        if self.buffered_bytes + byte_count > self.memory_budget_bytes {
+            if self.chunks.contains_key(&key) {
+                self.spill_in_memory_chunk(&key)?;
+                return self.append_to_spilled(key, bytes);
+            }
+            return self.write_new_spilled_chunk(key, bytes);
+        }
+
+        match self.chunks.get_mut(&key) {
+            Some(ChunkBuffer::InMemory {
+                bytes: existing,
+                point_count,
+            }) => {
+                existing.extend_from_slice(&bytes);
+                *point_count += 1;
+            }
+            Some(ChunkBuffer::Spilled { .. }) => unreachable!("spilling is added in Task 3"),
+            None => {
+                self.chunks.insert(
+                    key,
+                    ChunkBuffer::InMemory {
+                        bytes,
+                        point_count: 1,
+                    },
+                );
+            }
+        }
+        self.buffered_bytes += byte_count;
+        Ok(())
+    }
+
+    fn ensure_budget_for(&mut self, additional_bytes: usize) -> crate::Result<()> {
+        let additional_bytes = additional_bytes as u64;
+        while self.buffered_bytes + additional_bytes > self.memory_budget_bytes {
+            if !self.spill_largest_in_memory_chunk()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn spill_largest_in_memory_chunk(&mut self) -> crate::Result<bool> {
+        let key = self
+            .chunks
+            .iter()
+            .filter_map(|(key, chunk)| match chunk {
+                ChunkBuffer::InMemory { bytes, .. } => Some((key.clone(), bytes.len())),
+                ChunkBuffer::Spilled { .. } => None,
+            })
+            .max_by_key(|(_, len)| *len)
+            .map(|(key, _)| key);
+
+        match key {
+            Some(key) => {
+                self.spill_in_memory_chunk(&key)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn spill_in_memory_chunk(&mut self, key: &VoxelKey) -> crate::Result<()> {
+        let path = self.spill_path_for(key);
+        fs::create_dir_all(&self.temp_dir)?;
+        let Some(ChunkBuffer::InMemory { bytes, point_count }) = self.chunks.remove(key) else {
+            return Ok(());
+        };
+        let byte_count = bytes.len() as u64;
+        let mut file = File::create(&path)?;
+        file.write_all(&bytes)?;
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(byte_count);
+        self.chunks.insert(
+            key.clone(),
+            ChunkBuffer::Spilled {
+                path,
+                point_count,
+                byte_count,
+            },
+        );
+        Ok(())
+    }
+
+    fn write_new_spilled_chunk(&mut self, key: VoxelKey, bytes: Vec<u8>) -> crate::Result<()> {
+        let byte_count = bytes.len() as u64;
+        let path = self.spill_path_for(&key);
+        fs::create_dir_all(&self.temp_dir)?;
+        let mut file = File::create(&path)?;
+        file.write_all(&bytes)?;
+        self.chunks.insert(
+            key,
+            ChunkBuffer::Spilled {
+                path,
+                point_count: 1,
+                byte_count,
+            },
+        );
+        Ok(())
+    }
+
+    fn append_to_spilled(&mut self, key: VoxelKey, bytes: Vec<u8>) -> crate::Result<()> {
+        let Some(ChunkBuffer::Spilled {
+            path,
+            point_count,
+            byte_count,
+        }) = self.chunks.get_mut(&key)
+        else {
+            return self.write_new_spilled_chunk(key, bytes);
+        };
+
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(&bytes)?;
+        *point_count += 1;
+        *byte_count += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn spill_path_for(&self, key: &VoxelKey) -> PathBuf {
+        self.temp_dir.join(format!(
+            "node-{}-{}-{}-{}.bin",
+            key.level, key.x, key.y, key.z
+        ))
+    }
+
+    fn remove(&mut self, key: &VoxelKey) -> Option<ChunkBuffer> {
+        let chunk = self.chunks.remove(key)?;
+        if let ChunkBuffer::InMemory { bytes, .. } = &chunk {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes.len() as u64);
+        }
+        Some(chunk)
+    }
+
+    fn remove_temp_dir_if_empty(&self) -> crate::Result<()> {
+        match fs::remove_dir(&self.temp_dir) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::DirectoryNotEmpty
+                        | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn cleanup(&mut self) {
+        for chunk in self.chunks.values() {
+            if let ChunkBuffer::Spilled { path, .. } = chunk {
+                let _ = fs::remove_file(path);
+            }
+        }
+        let _ = fs::remove_dir(&self.temp_dir);
+    }
+}
+
+fn default_spill_dir() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("copc-rs-spill-{}-{nanos}", std::process::id()))
 }
 
 impl CopcWriter<'_, BufWriter<File>> {
@@ -58,6 +284,16 @@ impl CopcWriter<'_, BufWriter<File>> {
         header: Header,
         min_size: i32,
         max_size: i32,
+    ) -> crate::Result<Self> {
+        Self::from_path_with_options(path, header, min_size, max_size, WriterOptions::default())
+    }
+
+    pub fn from_path_with_options<P: AsRef<Path>>(
+        path: P,
+        header: Header,
+        min_size: i32,
+        max_size: i32,
+        options: WriterOptions,
     ) -> crate::Result<Self> {
         let copc_ext = Path::new(match path.as_ref().file_stem() {
             Some(copc) => copc,
@@ -79,7 +315,15 @@ impl CopcWriter<'_, BufWriter<File>> {
 
         File::create(path)
             .map_err(crate::Error::from)
-            .and_then(|file| CopcWriter::new(BufWriter::new(file), header, min_size, max_size))
+            .and_then(|file| {
+                CopcWriter::new_with_options(
+                    BufWriter::new(file),
+                    header,
+                    min_size,
+                    max_size,
+                    options,
+                )
+            })
     }
 }
 
@@ -113,7 +357,17 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
     /// A CRS VLR is __MANDATORY__ and without one
     ///
     /// [from_path]: Self::from_path
-    pub fn new(mut write: W, header: Header, min_size: i32, max_size: i32) -> crate::Result<Self> {
+    pub fn new(write: W, header: Header, min_size: i32, max_size: i32) -> crate::Result<Self> {
+        Self::new_with_options(write, header, min_size, max_size, WriterOptions::default())
+    }
+
+    pub fn new_with_options(
+        mut write: W,
+        header: Header,
+        min_size: i32,
+        max_size: i32,
+        options: WriterOptions,
+    ) -> crate::Result<Self> {
         let start = write.stream_position()?;
 
         let min_node_size = if min_size < 1 {
@@ -353,6 +607,8 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             gpstime_maximum: f64::MIN,
         };
 
+        let chunk_store = ChunkStore::new(&options)?;
+
         Ok(CopcWriter {
             is_closed: false,
             start,
@@ -363,7 +619,8 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             max_node_size,
             copc_info,
             root_node,
-            open_chunks: HashMap::default(),
+            chunk_store,
+            voxel_occupancy: HashMap::default(),
         })
     }
 
@@ -372,15 +629,11 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
     /// Only one iterator can be written so a call to [Self::write] closes the writer.
     ///
     /// `num_points` is the number of points in the iterator
-    /// the number of points is used for stochastically filling the nodes
+    /// the number of points is used to choose between a single greedy chunk and
+    /// deterministic voxel-grid LOD placement
     /// if `num_points` is < 1 a greedy filling strategy is used
-    /// this should only be used if the passed iterator is randomly ordered
-    /// which most of the time not is the case
     /// if `num_points` is not equal to the actual number of points in the
-    /// iterator all points will still be written but the point distribution
-    /// in a node will not represent of the entire distribution over that node
-    /// i.e. only full resolution queries will look right which means the point cloud
-    /// will look wierd in any viewer which utilizes the COPC information
+    /// iterator all points will still be written
     ///
     /// returns an `Err`([crate::Error::ClosedWriter]) if the writer has already been closed.
     ///
@@ -409,8 +662,8 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             // greedy filling strategy
             self.write_greedy(data)
         } else {
-            // stochastic filling strategy
-            self.write_stochastic(data, num_points as usize)
+            // deterministic voxel-grid filling strategy
+            self.write_voxel(data)
         };
 
         self.close()?;
@@ -419,7 +672,12 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
 
     /// Like [`Self::write`] but polls `cancel` every 4096 points and aborts with
     /// [`crate::Error::Cancelled`] if it returns true. Closes the writer on success.
-    pub fn write_cancellable<D, F>(&mut self, data: D, num_points: i32, mut cancel: F) -> crate::Result<()>
+    pub fn write_cancellable<D, F>(
+        &mut self,
+        data: D,
+        num_points: i32,
+        mut cancel: F,
+    ) -> crate::Result<()>
     where
         D: IntoIterator<Item = las::Point>,
         F: FnMut() -> bool,
@@ -428,13 +686,13 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             return Err(crate::Error::ClosedWriter);
         }
         let greedy = num_points < self.max_node_size + self.min_node_size;
-        let levels = self.expected_levels(num_points.max(0) as usize);
         let mut invalid = Ok(());
         for (i, p) in data.into_iter().enumerate() {
             if i % 4096 == 0 && cancel() {
                 // copc-rs's Drop calls close().expect(), which panics on an
                 // unfinished writer. Mark closed so the abort unwinds cleanly
                 // (the partial file is the caller's to delete).
+                self.chunk_store.cleanup();
                 self.is_closed = true;
                 return Err(crate::Error::Cancelled);
             }
@@ -446,14 +704,16 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             }
             if !bounds_contains_point(&self.root_node.bounds, &p) {
                 if invalid.is_ok() {
-                    invalid = Err(crate::Error::InvalidPoint(crate::PointAddError::PointNotInBounds));
+                    invalid = Err(crate::Error::InvalidPoint(
+                        crate::PointAddError::PointNotInBounds,
+                    ));
                 }
                 continue;
             }
-            if greedy || (num_points as usize) <= i {
+            if greedy {
                 self.add_point_greedy(p)?;
             } else {
-                self.add_point_stochastic(p, levels)?;
+                self.add_point_voxel(p)?;
             }
         }
         self.close()?;
@@ -493,11 +753,70 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
 
 /// private functions
 impl<W: Write + Seek> CopcWriter<'_, W> {
-    /// Expected octree depth for the stochastic fill (2D-surface assumption).
-    fn expected_levels(&self, num_points: usize) -> usize {
-        ((((3 * num_points) as f64 / self.max_node_size as f64 + 1.).log2() - 2.) / 2.)
-            .ceil()
-            .max(0.0) as usize
+    fn voxel_grid_size(&self) -> i64 {
+        ((self.max_node_size as f64).sqrt().round() as i64).max(2)
+    }
+
+    fn max_voxel_level(&self) -> i32 {
+        let edge = 2.0 * self.copc_info.halfsize;
+        let scale = self
+            .header
+            .transforms()
+            .x
+            .scale
+            .abs()
+            .min(self.header.transforms().y.scale.abs())
+            .min(self.header.transforms().z.scale.abs());
+        if edge.is_normal() && scale.is_normal() && scale.is_sign_positive() {
+            (edge / scale).log2().ceil() as i32
+        } else {
+            DEFAULT_MAX_VOXEL_LEVEL
+        }
+        .clamp(0, MAX_VOXEL_LEVEL_CAP)
+    }
+
+    fn add_point_to_header(&mut self, point: &las::Point) {
+        self.header.add_point(point);
+
+        let gps_time = point.gps_time.unwrap_or(0.0);
+        if gps_time < self.copc_info.gpstime_minimum {
+            self.copc_info.gpstime_minimum = gps_time;
+        }
+        if gps_time > self.copc_info.gpstime_maximum {
+            self.copc_info.gpstime_maximum = gps_time;
+        }
+    }
+
+    fn write_point_to_open_chunk(&mut self, key: VoxelKey, point: las::Point) -> crate::Result<()> {
+        let raw_point = point.into_raw(self.header.transforms())?;
+        let mut bytes = vec![];
+        raw_point.write_to(&mut bytes, self.header.point_format())?;
+        self.chunk_store.append(key, bytes)
+    }
+
+    /// Voxel-grid strategy for writing points.
+    fn write_voxel<D: IntoIterator<Item = las::Point>>(&mut self, data: D) -> crate::Result<()> {
+        let mut invalid_points = Ok(());
+
+        for p in data.into_iter() {
+            if !p.matches(self.header.point_format()) {
+                invalid_points = Err(crate::Error::InvalidPoint(
+                    crate::PointAddError::PointAttributesDoNotMatch(*self.header.point_format()),
+                ));
+                continue;
+            }
+            if !bounds_contains_point(&self.root_node.bounds, &p) {
+                if invalid_points.is_ok() {
+                    invalid_points = Err(crate::Error::InvalidPoint(
+                        crate::PointAddError::PointNotInBounds,
+                    ));
+                }
+                continue;
+            }
+
+            self.add_point_voxel(p)?;
+        }
+        invalid_points
     }
 
     /// Greedy strategy for writing points
@@ -525,58 +844,6 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         invalid_points
     }
 
-    /// Stochastic strategy for writing points
-    fn write_stochastic<D: IntoIterator<Item = las::Point>>(
-        &mut self,
-        data: D,
-        num_points: usize,
-    ) -> crate::Result<()> {
-        let mut invalid_points = Ok(());
-
-        // the number of expected levels in the copc hierarchy
-        // assuming that the lidar scans cover a way bigger horizontal span than vertical
-        // effectivly dividing every level into 4 instead of 8
-        // (removing this assumption would lead to a division by 3 instead of 2, and thus fewer expected levels)
-        //
-        // each level then holds 4^i * max_points_per_node points
-        //
-        // solve for l:
-        // num_points / sum_i=0^l 4^i = max_points_per_node
-        //
-        // sum_i=0^l 4^i = 1/3 (4^(l+1) - 1)
-        // =>
-        // l = (log_2( 3*num_points/max_points_per_node + 1) - 2)/2
-        let expected_levels =
-            ((((3 * num_points) as f64 / self.max_node_size as f64 + 1.).log2() - 2.) / 2.).ceil()
-                as usize;
-
-        for (i, p) in data.into_iter().enumerate() {
-            if !p.matches(self.header.point_format()) {
-                invalid_points = Err(crate::Error::InvalidPoint(
-                    crate::PointAddError::PointAttributesDoNotMatch(*self.header.point_format()),
-                ));
-                continue;
-            }
-            if !bounds_contains_point(&self.root_node.bounds, &p) {
-                if invalid_points.is_ok() {
-                    invalid_points = Err(crate::Error::InvalidPoint(
-                        crate::PointAddError::PointNotInBounds,
-                    ));
-                }
-                continue;
-            }
-
-            // if the given num_points was smaller than the actual number of points
-            // and we have passed that number revert to the greedy strategy
-            if num_points <= i {
-                self.add_point_greedy(p)?;
-            } else {
-                self.add_point_stochastic(p, expected_levels)?;
-            }
-        }
-        invalid_points
-    }
-
     /// Close is called after the last point is written
     fn close(&mut self) -> crate::Result<()> {
         if self.is_closed {
@@ -587,19 +854,36 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         }
 
         // write the unclosed chunks, order does not matter
-        for (key, chunk) in self.open_chunks.drain() {
-            let inner = chunk.into_inner();
-            if inner.is_empty() {
-                continue;
+        for (key, chunk) in self.chunk_store.chunks.drain() {
+            match chunk {
+                ChunkBuffer::InMemory { bytes, .. } => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let (chunk_table_entry, chunk_offset) =
+                        self.compressor.compress_chunk(bytes)?;
+                    self.hierarchy.entries.push(Entry {
+                        key,
+                        offset: chunk_offset,
+                        byte_size: chunk_table_entry.byte_count as i32,
+                        point_count: chunk_table_entry.point_count as i32,
+                    })
+                }
+                ChunkBuffer::Spilled { path, .. } => {
+                    let bytes = fs::read(&path)?;
+                    let (chunk_table_entry, chunk_offset) =
+                        self.compressor.compress_chunk(bytes)?;
+                    fs::remove_file(&path)?;
+                    self.hierarchy.entries.push(Entry {
+                        key,
+                        offset: chunk_offset,
+                        byte_size: chunk_table_entry.byte_count as i32,
+                        point_count: chunk_table_entry.point_count as i32,
+                    })
+                }
             }
-            let (chunk_table_entry, chunk_offset) = self.compressor.compress_chunk(inner)?;
-            self.hierarchy.entries.push(Entry {
-                key,
-                offset: chunk_offset,
-                byte_size: chunk_table_entry.byte_count as i32,
-                point_count: chunk_table_entry.point_count as i32,
-            })
         }
+        self.chunk_store.remove_temp_dir_if_empty()?;
 
         self.compressor.done()?;
 
@@ -640,12 +924,7 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         })?;
 
         // update the copc info vlr and write it
-        // Root-level point spacing. LiDAR points lie on ~2D surfaces, so
-        // points-per-edge ~= sqrt(root_node_points); spacing = cube edge / that.
-        // (Upstream used edge/point_count, ~sqrt(N)x too small, misinforming
-        // viewer LOD selection — measured 0.066 vs PDAL's 7.40 on a real cloud.)
-        let root_pts = self.root_node.entry.point_count.max(1) as f64;
-        self.copc_info.spacing = 2. * self.copc_info.halfsize / root_pts.sqrt();
+        self.copc_info.spacing = 2. * self.copc_info.halfsize / self.voxel_grid_size() as f64;
         self.copc_info.root_hier_offset = start_of_first_evlr + 60; // the header is 60bytes
         self.copc_info.root_hier_size = self.hierarchy.byte_size();
 
@@ -667,13 +946,7 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
     // and add it to the node, if the node now is full
     // add the node to the hierarchy page and write to file
     fn add_point_greedy(&mut self, point: las::Point) -> crate::Result<()> {
-        self.header.add_point(&point);
-
-        if point.gps_time.unwrap_or(0.0) < self.copc_info.gpstime_minimum {
-            self.copc_info.gpstime_minimum = point.gps_time.unwrap_or(0.0);
-        } else if point.gps_time.unwrap_or(0.0) > self.copc_info.gpstime_maximum {
-            self.copc_info.gpstime_maximum = point.gps_time.unwrap_or(0.0);
-        }
+        self.add_point_to_header(&point);
 
         let mut node_key = None;
         let mut write_chunk = false;
@@ -727,156 +1000,78 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
             return Err(crate::Error::PointNotAddedToAnyNode);
         };
 
-        let raw_point = point.into_raw(self.header.transforms())?;
-
-        if !self.open_chunks.contains_key(&node_key) {
-            let mut val = Cursor::new(vec![]);
-            raw_point.write_to(&mut val, self.header.point_format())?;
-
-            self.open_chunks.insert(node_key.clone(), val);
-        } else {
-            let buffer = self.open_chunks.get_mut(&node_key).unwrap();
-            raw_point.write_to(buffer, self.header.point_format())?;
-        }
+        self.write_point_to_open_chunk(node_key.clone(), point)?;
 
         if write_chunk {
-            let chunk = self.open_chunks.remove(&node_key).unwrap();
-            let (chunk_table_entry, chunk_offset) =
-                self.compressor.compress_chunk(chunk.into_inner())?;
-            self.hierarchy.entries.push(Entry {
-                key: node_key,
-                offset: chunk_offset,
-                byte_size: chunk_table_entry.byte_count as i32,
-                point_count: chunk_table_entry.point_count as i32,
-            });
-        }
-        Ok(())
-    }
-
-    fn add_point_stochastic(
-        &mut self,
-        point: las::Point,
-        expected_levels: usize,
-    ) -> crate::Result<()> {
-        // strategy: find the deepest node that contains this point
-        // choose at (weighted) random this node or one of its parents
-        // add point to that node
-        // write full nodes to file
-
-        let root_bounds = self.root_node.bounds;
-
-        let mut node_candidates = vec![];
-
-        // starting from the root walk thorugh the octree
-        let mut nodes_to_check = vec![&mut self.root_node];
-        while let Some(node) = nodes_to_check.pop() {
-            if !bounds_contains_point(&node.bounds, &point) {
-                // the point does not belong to this subtree
-                continue;
-            }
-
-            if node.children.is_empty() && node.entry.key.level < expected_levels as i32 {
-                let child_keys = node.entry.key.children();
-                for key in child_keys {
-                    let child_bounds = key.bounds(&root_bounds);
-                    node.children.push(OctreeNode {
-                        entry: Entry {
-                            key,
-                            offset: 0,
-                            byte_size: 0,
-                            point_count: 0,
-                        },
-                        bounds: child_bounds,
-                        children: Vec::with_capacity(8),
-                    })
+            let chunk = self.chunk_store.remove(&node_key).unwrap();
+            match chunk {
+                ChunkBuffer::InMemory { bytes, .. } => {
+                    let (chunk_table_entry, chunk_offset) =
+                        self.compressor.compress_chunk(bytes)?;
+                    self.hierarchy.entries.push(Entry {
+                        key: node_key,
+                        offset: chunk_offset,
+                        byte_size: chunk_table_entry.byte_count as i32,
+                        point_count: chunk_table_entry.point_count as i32,
+                    });
+                }
+                ChunkBuffer::Spilled { path, .. } => {
+                    let bytes = fs::read(&path)?;
+                    let (chunk_table_entry, chunk_offset) =
+                        self.compressor.compress_chunk(bytes)?;
+                    fs::remove_file(&path)?;
+                    self.hierarchy.entries.push(Entry {
+                        key: node_key,
+                        offset: chunk_offset,
+                        byte_size: chunk_table_entry.byte_count as i32,
+                        point_count: chunk_table_entry.point_count as i32,
+                    });
                 }
             }
-            if !node.is_full(self.max_node_size) {
-                node_candidates.push(&mut node.entry);
-            }
-            // push the children to the stack
-            for child in node.children.iter_mut() {
-                nodes_to_check.push(child);
-            }
-        }
-
-        if node_candidates.is_empty() {
-            // we need to add a new level, revert to greedy approach
-            return self.add_point_greedy(point);
-        }
-
-        // weighted by the inverse of the area (should volume be used?) the nodes cover
-        let chosen_index = get_random_weighted_index(&node_candidates);
-
-        let chosen_entry = &mut node_candidates[chosen_index];
-
-        chosen_entry.point_count += 1;
-
-        let write_chunk = chosen_entry.point_count > self.max_node_size;
-
-        let node_key = chosen_entry.key.clone();
-
-        self.header.add_point(&point);
-
-        if point.gps_time.unwrap_or(0.0) < self.copc_info.gpstime_minimum {
-            self.copc_info.gpstime_minimum = point.gps_time.unwrap_or(0.0);
-        } else if point.gps_time.unwrap_or(0.0) > self.copc_info.gpstime_maximum {
-            self.copc_info.gpstime_maximum = point.gps_time.unwrap_or(0.0);
-        }
-
-        let raw_point = point.into_raw(self.header.transforms())?;
-
-        if !self.open_chunks.contains_key(&node_key) {
-            let mut val = Cursor::new(vec![]);
-            raw_point.write_to(&mut val, self.header.point_format())?;
-
-            self.open_chunks.insert(node_key.clone(), val);
-        } else {
-            let buffer = self.open_chunks.get_mut(&node_key).unwrap();
-            raw_point.write_to(buffer, self.header.point_format())?;
-        }
-
-        if write_chunk {
-            let chunk = self.open_chunks.remove(&node_key).unwrap();
-            let (chunk_table_entry, chunk_offset) =
-                self.compressor.compress_chunk(chunk.into_inner())?;
-            self.hierarchy.entries.push(Entry {
-                key: node_key,
-                offset: chunk_offset,
-                byte_size: chunk_table_entry.byte_count as i32,
-                point_count: chunk_table_entry.point_count as i32,
-            });
         }
         Ok(())
     }
-}
 
-fn get_random_weighted_index(entries: &Vec<&mut Entry>) -> usize {
-    // calculate weights
-    let levels: Vec<i32> = entries.iter().map(|e| e.key.level).collect();
-    let zero_level = levels[0];
+    fn add_point_voxel(&mut self, point: las::Point) -> crate::Result<()> {
+        self.add_point_to_header(&point);
 
-    // for each level down the side lengths are halved i.e area is a quarter
-    let areas: Vec<f64> = levels
-        .iter()
-        .map(|l| (0.25_f64).powi(l - zero_level))
-        .collect();
-    // total inv area
-    let inv_sum = areas.iter().fold(0., |acc, a| acc + 1. / a);
+        let grid = self.voxel_grid_size();
+        let max_level = self.max_voxel_level();
+        let root_bounds = self.root_node.bounds;
+        let mut key = VoxelKey {
+            level: 0,
+            x: 0,
+            y: 0,
+            z: 0,
+        };
+        let mut node_bounds = root_bounds;
 
-    let weights: Vec<f64> = areas.iter().map(|a| (1. / a) / inv_sum).collect();
+        loop {
+            let cell = voxel_cell(&node_bounds, &point, grid);
+            let claimed = self
+                .voxel_occupancy
+                .entry(key.clone())
+                .or_default()
+                .insert(cell);
 
-    // get random index
-    let random = fastrand::f64();
-    let mut chosen_index = weights.len() - 1;
+            if claimed || key.level >= max_level {
+                return self.write_point_to_open_chunk(key, point);
+            }
 
-    for i in 0..weights.len() - 1 {
-        if (weights[i]..=weights[i + 1]).contains(&random) {
-            chosen_index = i;
-            break;
+            let center_x = (node_bounds.min.x + node_bounds.max.x) / 2.0;
+            let center_y = (node_bounds.min.y + node_bounds.max.y) / 2.0;
+            let center_z = (node_bounds.min.z + node_bounds.max.z) / 2.0;
+            let dir = (point.x >= center_x) as i32
+                | (((point.y >= center_y) as i32) << 1)
+                | (((point.z >= center_z) as i32) << 2);
+            key = key.child(dir);
+            node_bounds = key.bounds(&root_bounds);
+            debug_assert!(
+                bounds_contains_point(&node_bounds, &point),
+                "voxel descent must keep the point in the selected key bounds"
+            );
         }
     }
-    chosen_index
 }
 
 impl<W: Write + Seek> Drop for CopcWriter<'_, W> {
@@ -884,10 +1079,23 @@ impl<W: Write + Seek> Drop for CopcWriter<'_, W> {
         if !self.is_closed {
             // can only happen if the writer is created but no points is written
             // or something goes wrong while writing
-            self.close()
-                .expect("Error when dropping the writer. No points written.");
+            if let Err(e) = self.close() {
+                self.chunk_store.cleanup();
+                panic!("Error when dropping the writer. No points written.: {e}");
+            }
         }
     }
+}
+
+fn voxel_cell(bounds: &las::Bounds, point: &las::Point, grid: i64) -> u64 {
+    let edge = bounds.max.x - bounds.min.x;
+    let index = |value: f64, min: f64| -> i64 {
+        (((value - min) / edge * grid as f64).floor() as i64).clamp(0, grid - 1)
+    };
+    let x = index(point.x, bounds.min.x);
+    let y = index(point.y, bounds.min.y);
+    let z = index(point.z, bounds.min.z);
+    (x + y * grid + z * grid * grid) as u64
 }
 
 #[inline]

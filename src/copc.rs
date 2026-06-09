@@ -128,9 +128,13 @@ impl VoxelKey {
         (0..8).map(|i| self.child(i)).collect()
     }
     pub(crate) fn bounds(&self, root_bounds: &Bounds) -> Bounds {
+        debug_assert!(self.level >= 0, "voxel key level must be non-negative");
+        debug_assert!(
+            self.level < 32,
+            "voxel key level should remain below i32 child-shift limits"
+        );
         // In an octree every cell is a cube
-        let side_size =
-            (root_bounds.max.x - root_bounds.min.x) / 2_u32.pow(self.level as u32) as f64;
+        let side_size = (root_bounds.max.x - root_bounds.min.x) / (2.0_f64).powi(self.level);
 
         Bounds {
             min: Vector {
