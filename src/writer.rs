@@ -720,6 +720,84 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         invalid
     }
 
+    /// Like [`Self::write`] but reports build progress through `progress(done, total)`
+    /// across **both** phases — point ingest *and* the close/serialize pass — so the
+    /// bar never sprints to 100% and then stalls while `close()` compresses chunks.
+    ///
+    /// `total` is `2 * num_points`: every point is effectively touched twice — once
+    /// decoded + voxel-placed on ingest, once LAZ-compressed on serialize — so the
+    /// phases share the bar ~50/50, matching their real cost. The callback is
+    /// throttled to whole-percent changes and, on ingest, only sampled every 4096
+    /// points, so it adds no measurable per-point overhead. A terminal
+    /// `progress(total, total)` is always emitted. Closes the writer like
+    /// [`Self::write`].
+    pub fn write_with_progress<D, F>(
+        &mut self,
+        data: D,
+        num_points: i32,
+        mut progress: F,
+    ) -> crate::Result<()>
+    where
+        D: IntoIterator<Item = las::Point>,
+        F: FnMut(u64, u64),
+    {
+        if self.is_closed {
+            return Err(crate::Error::ClosedWriter);
+        }
+        let base = num_points.max(0) as u64;
+        let total = base.saturating_mul(2).max(1);
+        let greedy = num_points < self.max_node_size + self.min_node_size;
+        let mut invalid = Ok(());
+        let mut last_pct: i64 = -1;
+
+        // Phase A — ingest: report points pulled from the source (0..=base), sampled
+        // every 4096 points (a bitmask-cheap check, same cadence as write_cancellable).
+        for (i, p) in data.into_iter().enumerate() {
+            if i % 4096 == 0 {
+                let done = i as u64;
+                let pct = (done * 100 / total) as i64;
+                if pct != last_pct {
+                    last_pct = pct;
+                    progress(done, total);
+                }
+            }
+            if !p.matches(self.header.point_format()) {
+                invalid = Err(crate::Error::InvalidPoint(
+                    crate::PointAddError::PointAttributesDoNotMatch(*self.header.point_format()),
+                ));
+                continue;
+            }
+            if !bounds_contains_point(&self.root_node.bounds, &p) {
+                if invalid.is_ok() {
+                    invalid = Err(crate::Error::InvalidPoint(
+                        crate::PointAddError::PointNotInBounds,
+                    ));
+                }
+                continue;
+            }
+            if greedy {
+                self.add_point_greedy(p)?;
+            } else {
+                self.add_point_voxel(p)?;
+            }
+        }
+
+        // Phase B — serialize: each compressed chunk advances the bar past `base`.
+        let mut compressed: u64 = 0;
+        self.close_inner(|chunk_points| {
+            compressed = compressed.saturating_add(chunk_points);
+            let done = base.saturating_add(compressed).min(total);
+            let pct = (done * 100 / total) as i64;
+            if pct != last_pct {
+                last_pct = pct;
+                progress(done, total);
+            }
+        })?;
+
+        progress(total, total); // guarantee a terminal 100%
+        invalid
+    }
+
     /// Whether this writer is closed or not
     pub fn is_closed(&self) -> bool {
         self.is_closed
@@ -844,8 +922,19 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
         invalid_points
     }
 
-    /// Close is called after the last point is written
+    /// Close is called after the last point is written.
     fn close(&mut self) -> crate::Result<()> {
+        self.close_inner(|_| {})
+    }
+
+    /// Like [`Self::close`] but invokes `on_chunk(point_count)` after each octree
+    /// chunk is compressed and written out. The close pass LAZ-compresses every
+    /// buffered chunk (and re-reads any spilled to disk), so it is a meaningful
+    /// share of total build time — surfacing per-chunk completion lets a progress
+    /// reporter span both the ingest and the serialize phases instead of stalling
+    /// at "100%" while close() runs. The callback is the only addition; the write
+    /// path is otherwise byte-for-byte identical to [`Self::close`].
+    fn close_inner(&mut self, mut on_chunk: impl FnMut(u64)) -> crate::Result<()> {
         if self.is_closed {
             return Err(crate::Error::ClosedWriter);
         }
@@ -855,7 +944,7 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
 
         // write the unclosed chunks, order does not matter
         for (key, chunk) in self.chunk_store.chunks.drain() {
-            match chunk {
+            let point_count = match chunk {
                 ChunkBuffer::InMemory { bytes, .. } => {
                     if bytes.is_empty() {
                         continue;
@@ -867,7 +956,8 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
                         offset: chunk_offset,
                         byte_size: chunk_table_entry.byte_count as i32,
                         point_count: chunk_table_entry.point_count as i32,
-                    })
+                    });
+                    chunk_table_entry.point_count as u64
                 }
                 ChunkBuffer::Spilled { path, .. } => {
                     let bytes = fs::read(&path)?;
@@ -879,9 +969,11 @@ impl<W: Write + Seek> CopcWriter<'_, W> {
                         offset: chunk_offset,
                         byte_size: chunk_table_entry.byte_count as i32,
                         point_count: chunk_table_entry.point_count as i32,
-                    })
+                    });
+                    chunk_table_entry.point_count as u64
                 }
-            }
+            };
+            on_chunk(point_count);
         }
         self.chunk_store.remove_temp_dir_if_empty()?;
 
